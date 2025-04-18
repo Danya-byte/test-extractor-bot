@@ -94,9 +94,14 @@ const getProcessingStatus = async (chatId) => await redis.get(`processing:${chat
 
 app.post('/trigger-extension', async (req, res) => {
   const { chatId, action } = req.body;
+  Logger.info(`Получен запрос на /trigger-extension`, { body: req.body });
+  if (!chatId) {
+    Logger.error(`chatId отсутствует в теле запроса`, { body: req.body });
+    return res.status(400).json({ error: 'chatId обязателен' });
+  }
   Logger.info(`Инициирована отправка команды расширению`, { chatId, action });
   await setPendingCommands(chatId.toString(), { command: action, chatId });
-  await setProcessingStatus(chatId, 'pending');
+  await setProcessingStatus(chatId.toString(), 'pending');
   res.json({ message: 'Команда сохранена, ожидается обработка расширением' });
 });
 
@@ -208,23 +213,36 @@ app.post('/process-questions', async (req, res) => {
   const { questions, combinedPrompt, model } = req.body;
   Logger.info(`Получен запрос на обработку вопросов`, { questionCount: questions.length, model });
   try {
-    Logger.info(`Отправка запроса к ИИ`, { model, promptLength: combinedPrompt.length });
-    const completion = await client.chat.completions.create({
-      model,
-      messages: [
-        {
-          role: 'system',
-          content: 'Ты — эксперт. Верни ответы в формате: "Ответ X: [текст]" для текстовых вопросов или "Ответ X: [цифра]. [текст]" или "Ответ X: [цифра]. [текст], [цифра]. [текст]" для вопросов с вариантами.'
-        },
-        { role: 'user', content: combinedPrompt }
-      ],
-      max_tokens: 16000,
-      headers: {
-        "HTTP-Referer": process.env.SERVER_URL,
-        "X-Title": "Proktoring Helper"
+    let attempts = 0;
+    const maxAttempts = 3;
+    let rawContent;
+    while (attempts < maxAttempts) {
+      Logger.info(`Отправка запроса к ИИ, попытка ${attempts + 1}`, { model, promptLength: combinedPrompt.length });
+      const completion = await client.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content: 'Ты — эксперт. Верни ответы в формате: "Ответ X: [текст]" для текстовых вопросов или "Ответ X: [цифра]. [текст]" или "Ответ X: [цифра]. [текст], [цифра]. [текст]" для вопросов с вариантами. Ответ "Ответ неизвестен" недопустим.'
+          },
+          { role: 'user', content: combinedPrompt }
+        ],
+        max_tokens: 16000,
+        headers: {
+          "HTTP-Referer": process.env.SERVER_URL,
+          "X-Title": "Proktoring Helper"
+        }
+      });
+      rawContent = completion.choices[0].message.content.trim();
+      if (!rawContent.toUpperCase().includes('ОТВЕТ НЕИЗВЕСТЕН')) {
+        break;
       }
-    });
-    const rawContent = completion.choices[0].message.content.trim();
+      Logger.warn(`Получен недопустимый ответ "Ответ неизвестен", повтор запроса`, { attempt: attempts + 1 });
+      attempts++;
+      if (attempts === maxAttempts) {
+        throw new Error('Не удалось получить корректный ответ после максимального количества попыток');
+      }
+    }
     const answerLines = rawContent.split('\n').filter(line => line.trim());
     const allAnswers = new Array(questions.length).fill(null);
     for (const line of answerLines) {
@@ -239,19 +257,14 @@ app.post('/process-questions', async (req, res) => {
     }
     const results = questions.map((q, i) => ({
       question: q.question,
-      answer: allAnswers[i] || 'Ответ неизвестен',
+      answer: allAnswers[i] || 'Не удалось определить ответ',
       options: q.options || []
     }));
     Logger.info(`Получены ответы от ИИ`, { resultCount: results.length });
     res.json({ results, modelSwitched: false, currentModel: model });
   } catch (error) {
     Logger.error(`Ошибка обработки ИИ`, { error: error.message, stack: error.stack });
-    const results = questions.map((q, i) => ({
-      question: q.question,
-      answer: 'Ответ будет добавлен позже (ошибка ИИ)',
-      options: q.options || []
-    }));
-    res.json({ results, modelSwitched: false, currentModel: model });
+    res.status(500).json({ error: 'Не удалось получить корректный ответ от ИИ' });
   }
 });
 
